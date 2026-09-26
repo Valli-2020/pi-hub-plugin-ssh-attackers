@@ -1,0 +1,14 @@
+{
+  "name": "ssh-attackers",
+  "version": "1.1.0",
+  "description": "Live failed-sshd-login monitor: a topbar alert with a cooldown while an attack runs, plus a ranked attacker table with country, ISP, ASN and reverse DNS",
+  "min_core_version": "8.0.0",
+  "plugin_api_version": 2,
+  "author": "Valli-2020",
+  "license": "MIT",
+  "capabilities": [
+    "ui.header",
+    "ui.style",
+    "ui.tab"
+  ]
+}

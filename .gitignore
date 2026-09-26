@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+*.tar.gz
+.pi-hub-backups/
+config.json
