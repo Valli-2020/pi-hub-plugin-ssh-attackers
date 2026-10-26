@@ -2,7 +2,7 @@
 
 Run against a Pi Hub checkout:
 
-    PIHUB_DIR=/home/pi/pi-hub python3 -m unittest discover -s tests -v
+    PIHUB_DIR=/home/pi/projects/pi-hub/pi-hub-dev python3 -m unittest discover -s tests -v
 
 Stdlib only — Pi Hub has no pip, and neither should its plugins' tests.
 """
