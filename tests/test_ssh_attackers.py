@@ -276,7 +276,7 @@ def _contrib():
     except ImportError as exc:                      # pragma: no cover
         raise unittest.SkipTest(f"contrib not importable: {exc}")
     for ftype in ("url", "list"):
-        if ftype not in contrib.FIELD_TYPES:
+        if ftype not in getattr(contrib, "CONFIG_FIELD_TYPES", contrib.FIELD_TYPES):
             raise unittest.SkipTest(
                 f"core contrib lacks {ftype!r} in FIELD_TYPES (pre-8.3.0)")
     return contrib
@@ -302,7 +302,8 @@ class SchemaTests(unittest.TestCase):
         defaults = {f["name"]: f["default"] for f in self.schema
                     if "default" in f}
         defaults["collector_url"] = "http://192.0.2.10:9101"
-        values, err = contrib.coerce_config_values(self.schema, defaults, {})
+        values, err = contrib.coerce_config_values(
+            contrib.validate_config_schema(self.schema), defaults, {})
         self.assertIsNone(err)
         self.assertEqual(values["geo_url"], mod.DEFAULT_CONFIG["geo_url"])
 
