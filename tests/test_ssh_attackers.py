@@ -2,7 +2,7 @@
 
 Run against a Pi Hub checkout:
 
-    PIHUB_DIR=/home/pi/projects/pi-hub/pi-hub-dev python3 -m unittest discover -s tests -v
+    PIHUB_DIR=/path/to/pi-hub python3 -m unittest discover -s tests -v
 
 Stdlib only — Pi Hub has no pip, and neither should its plugins' tests.
 """
@@ -140,13 +140,14 @@ class NodeTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def test_base_url_must_be_bare_host_and_port(self):
-        for bad in ("", "https://host:9101", "http://host:9101/path",
+        for bad in ("", "ftp://host:9101", "http://host:9101/path",
                     "http://user@host", "http://host\r\nX: 1"):
             self.assertFalse(mod.valid_base_url(bad), bad)
 
     def test_base_url_accepts_host_and_port(self):
-        self.assertTrue(mod.valid_base_url("http://100.100.100.1:9101"))
+        self.assertTrue(mod.valid_base_url("http://192.0.2.1:9101"))
         self.assertTrue(mod.valid_base_url("http://collector.lan"))
+        self.assertTrue(mod.valid_base_url("https://collector.example.local"))
 
     def test_clamp_falls_back_on_garbage(self):
         self.assertEqual(mod._clamp("x", 1, 10, 7), 7)
@@ -204,7 +205,7 @@ class LiveIntegrationTests(unittest.TestCase):
         mod.SshAttackersPlugin._lookup = lambda self, ip, cfg: {
             "country": "Romania", "city": "Bucharest", "isp": "UNMANAGED LTD",
             "asn": "AS47890", "rdns": "–"}
-        mod.SshAttackersPlugin._reverse_dns = lambda self, ip: "–"
+        mod.SshAttackersPlugin._reverse_dns = lambda self, ip, cfg=None: "–"
         self.plugin.load(self.ctx)
         self.addCleanup(self._teardown)
 
@@ -264,6 +265,105 @@ class LiveIntegrationTests(unittest.TestCase):
             self.plugin._snapshot["at"] = time.time() - 400
         node = self.plugin.provider_pill()
         self.assertEqual(node["text"], "SSH-Monitor offline")
+
+
+def _contrib():
+    """Core 8.3.0 contrib module from the dev tree, or a skip reason."""
+    if PIHUB_DIR and PIHUB_DIR not in sys.path:
+        sys.path.insert(0, PIHUB_DIR)
+    try:
+        from pi_hub.plugins import contrib
+    except ImportError as exc:                      # pragma: no cover
+        raise unittest.SkipTest(f"contrib not importable: {exc}")
+    for ftype in ("url", "list"):
+        if ftype not in contrib.FIELD_TYPES:
+            raise unittest.SkipTest(
+                f"core contrib lacks {ftype!r} in FIELD_TYPES (pre-8.3.0)")
+    return contrib
+
+
+class SchemaTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = mod.SshAttackersPlugin()
+        self.schema = self.plugin.get_config_schema()
+
+    def test_every_default_key_has_a_field(self):
+        names = {f["name"] for f in self.schema}
+        self.assertEqual(names, set(mod.DEFAULT_CONFIG))
+
+    def test_schema_passes_core_validator(self):
+        contrib = _contrib()
+        valid = contrib.validate_config_schema(self.schema)
+        self.assertEqual([f["name"] for f in valid],
+                         [f["name"] for f in self.schema])
+
+    def test_core_accepts_schema_defaults(self):
+        contrib = _contrib()
+        defaults = {f["name"]: f["default"] for f in self.schema
+                    if "default" in f}
+        defaults["collector_url"] = "http://192.0.2.10:9101"
+        values, err = contrib.coerce_config_values(self.schema, defaults, {})
+        self.assertIsNone(err)
+        self.assertEqual(values["geo_url"], mod.DEFAULT_CONFIG["geo_url"])
+
+
+class MigrateAndChangeTests(unittest.TestCase):
+    def _plugin(self, cfg):
+        plugin = mod.SshAttackersPlugin()
+        plugin.ctx = _StubContext(cfg)
+        plugin._lock = threading.Lock()
+        plugin._geo = {"192.0.2.5": (time.time() + 99, {})}
+        plugin._snapshot = {"rows": [1]}
+        plugin._wake = threading.Event()
+        return plugin
+
+    def test_migrate_old_1_1_config_keeps_values_and_adds_new_keys(self):
+        old = {"collector_url": "http://192.0.2.10:9101", "poll_interval": 30,
+               "active_poll_interval": 10, "cooldown_seconds": 90,
+               "min_attempts": 2, "limit": 8, "geo_ttl": 3600, "timeout": 5}
+        new = mod.SshAttackersPlugin().migrate_config("1.1.0", dict(old))
+        for key, value in old.items():
+            self.assertEqual(new[key], value)
+        self.assertTrue(new["geo_enabled"])
+        self.assertEqual(new["geo_url"], mod.DEFAULT_CONFIG["geo_url"])
+        self.assertEqual(new["rdns_timeout"], 3)
+
+    def test_migrate_is_idempotent(self):
+        once = mod.SshAttackersPlugin().migrate_config("1.1.0", {"limit": 7})
+        twice = mod.SshAttackersPlugin().migrate_config("1.2.0", dict(once))
+        self.assertEqual(once, twice)
+        self.assertEqual(once["limit"], 7)
+
+    def test_on_config_change_clears_cache_and_wakes(self):
+        plugin = self._plugin({})
+        plugin.on_config_change({"geo_enabled": True}, {"geo_enabled": False})
+        self.assertEqual(plugin._geo, {})
+        self.assertTrue(plugin._wake.is_set())
+
+    def test_on_config_change_collector_url_resets_snapshot(self):
+        plugin = self._plugin({})
+        plugin.on_config_change({"collector_url": "http://a"},
+                                {"collector_url": "http://b"})
+        self.assertEqual(plugin._snapshot, {})
+        self.assertTrue(plugin._geo)
+
+    def test_snapshot_rejects_bad_geo_url_and_non_bool(self):
+        plugin = self._plugin({"geo_url": "http://x/no-placeholder",
+                               "geo_enabled": "yes", "rdns_timeout": 999})
+        cfg = plugin._config_snapshot()
+        self.assertEqual(cfg["geo_url"], mod.DEFAULT_CONFIG["geo_url"])
+        self.assertTrue(cfg["geo_enabled"])
+        self.assertEqual(cfg["rdns_timeout"], mod.MAX_RDNS_TIMEOUT)
+
+    def test_lookup_skips_network_when_geo_disabled(self):
+        plugin = self._plugin({})
+        plugin._geo = {}
+        plugin._dns = None
+        cfg = plugin._config_snapshot()
+        cfg.update(geo_enabled=False, rdns_enabled=False)
+        info = plugin._lookup("192.0.2.5", cfg)
+        self.assertEqual(info["country"], mod.DASH)
+        self.assertEqual(info["rdns"], mod.DASH)
 
 
 class ManifestTests(unittest.TestCase):

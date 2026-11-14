@@ -11,7 +11,7 @@ Python stdlib only.  Needs read access to the journal (group
 
 Configure the bind address through the environment, never in the file:
 
-    SSH_WATCH_BIND=100.100.100.1 SSH_WATCH_PORT=9101
+    SSH_WATCH_BIND=192.0.2.10 SSH_WATCH_PORT=9101
 
 The default is loopback: reach it through an SSH tunnel or bind it to a
 management interface.  A public address would publish your attackers' IPs and

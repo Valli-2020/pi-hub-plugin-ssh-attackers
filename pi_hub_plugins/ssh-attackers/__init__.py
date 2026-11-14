@@ -52,9 +52,8 @@ log = logging.getLogger(__name__)
 
 DASH = "–"
 
-GEO_URL = "https://ipwho.is/{ip}?fields=success,country,region,city,connection"
-RDNS_TIMEOUT_S = 3.0
-GEO_TIMEOUT_S = 6
+GEO_URL = (
+    "https://ipwho.is/{ip}?fields=success,country,region,city,connection")
 GEO_FAIL_TTL_S = 600
 GEO_CACHE_MAX = 200
 MAX_COLLECTOR_BYTES = 1 << 20
@@ -75,6 +74,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "limit": 5,
     "geo_ttl": 86400,
     "timeout": 8,
+    "geo_enabled": True,
+    "geo_url": GEO_URL,
+    "geo_timeout": 6,
+    "rdns_enabled": True,
+    "rdns_timeout": 3,
 }
 
 MIN_POLL, MAX_POLL = 10, 3600
@@ -83,6 +87,8 @@ MIN_COOLDOWN, MAX_COOLDOWN = 15, 600
 MIN_ATTEMPTS, MAX_ATTEMPTS = 1, 1000
 MIN_LIMIT, MAX_LIMIT = 1, 20
 MIN_TIMEOUT, MAX_TIMEOUT = 1, 60
+MIN_GEO_TIMEOUT, MAX_GEO_TIMEOUT = 1, 30
+MIN_RDNS_TIMEOUT, MAX_RDNS_TIMEOUT = 1, 15
 
 #: The bar counts down to zero and disappears; this is its client refresh.
 PILL_POLL_S = 5
@@ -114,8 +120,8 @@ BAR_CSS = """
 .bar i[data-warm], .bar i[data-hot], .bar i { background:var(--bad); }
 """
 
-#: ``http://host[:port]`` only — no path, no userinfo, no CR/LF.
-_BASE_URL_RE = re.compile(r"http://[A-Za-z0-9.\-]+(:[0-9]{1,5})?")
+#: ``http(s)://host[:port]`` only — no path, no userinfo, no CR/LF.
+_BASE_URL_RE = re.compile(r"https?://[A-Za-z0-9.\-]+(:[0-9]{1,5})?")
 _IP_RE = re.compile(r"[0-9A-Fa-f:.]{2,45}")
 
 
@@ -130,10 +136,22 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def valid_base_url(url: str) -> bool:
-    """True when *url* is a bare ``http://host[:port]`` with no CR/LF."""
+    """True when *url* is a bare ``http(s)://host[:port]`` with no CR/LF."""
     if not url or "\r" in url or "\n" in url:
         return False
     return _BASE_URL_RE.fullmatch(url) is not None
+
+
+def _flag(value: Any, fallback: bool) -> bool:
+    return value if isinstance(value, bool) else fallback
+
+
+def valid_geo_url(url: Any) -> bool:
+    """True for an http(s) URL template that contains ``{ip}`` exactly once."""
+    return (isinstance(url, str) and url.count("{ip}") == 1
+            and url.startswith(("http://", "https://"))
+            and not any(c.isspace() or ord(c) < 32 for c in url)
+            and len(url) <= 2000)
 
 
 def _clamp(value: Any, low: int, high: int, fallback: int) -> int:
@@ -320,13 +338,13 @@ def tab_node(snapshot: dict[str, Any], now: float, cfg: dict[str, Any]) -> dict[
 
 class SshAttackersPlugin(Plugin):
     name = "ssh-attackers"
-    version = "1.1.0"
+    version = "1.2.0"
     description = (
         "Live failed-sshd-login monitor: a topbar alert with a cooldown while "
         "an attack runs, plus a ranked attacker table with country, ISP, ASN "
         "and reverse DNS"
     )
-    min_core_version = "8.0.0"
+    min_core_version = "8.3.0"
     plugin_api_version = 2
     capabilities: list[str] = ["ui.header", "ui.style", "ui.tab"]
 
@@ -338,6 +356,7 @@ class SshAttackersPlugin(Plugin):
         self._snapshot: dict[str, Any] = {}
         self._geo: dict[str, tuple[float, dict[str, str]]] = {}
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._dns = ThreadPoolExecutor(max_workers=2,
                                        thread_name_prefix="ssh-attackers-dns")
 
@@ -357,6 +376,7 @@ class SshAttackersPlugin(Plugin):
 
     def unload(self) -> None:
         self._stop.set()
+        self._wake.set()
         thread = getattr(self, "_thread", None)
         if thread is not None:
             thread.join(timeout=3.0)
@@ -378,35 +398,81 @@ class SshAttackersPlugin(Plugin):
         ]
 
     def get_config_schema(self) -> list[dict[str, Any]]:
+        d = DEFAULT_CONFIG
         return [
             {"name": "collector_url", "label": "Collector URL",
-             "type": "text", "required": True,
+             "type": "url", "required": True, "section": "Collector",
              "placeholder": "http://192.0.2.10:9101",
-             "help": "Base URL of the ssh-watch collector, no path."},
-            {"name": "cooldown_seconds", "label": "Cooldown (s)",
-             "type": "number", "default": DEFAULT_CONFIG["cooldown_seconds"],
-             "min": MIN_COOLDOWN, "max": MAX_COOLDOWN,
-             "help": "How long the topbar bar stays visible after the last attempt."},
-            {"name": "min_attempts", "label": "Min. Versuche",
-             "type": "number", "default": DEFAULT_CONFIG["min_attempts"],
-             "min": MIN_ATTEMPTS, "max": MAX_ATTEMPTS,
-             "help": "Failed attempts inside the window needed to raise the alarm."},
+             "help": "Base URL of the ssh-watch collector, no path. "
+                     "Applies on the next poll."},
             {"name": "poll_interval", "label": "Poll interval (s)",
-             "type": "number", "default": DEFAULT_CONFIG["poll_interval"],
-             "min": MIN_POLL, "max": MAX_POLL},
+             "type": "number", "default": d["poll_interval"],
+             "min": MIN_POLL, "max": MAX_POLL, "section": "Collector",
+             "help": "How often the collector is asked while it is quiet."},
             {"name": "active_poll_interval", "label": "Poll during attack (s)",
-             "type": "number", "default": DEFAULT_CONFIG["active_poll_interval"],
-             "min": MIN_ACTIVE_POLL, "max": MAX_ACTIVE_POLL},
+             "type": "number", "default": d["active_poll_interval"],
+             "min": MIN_ACTIVE_POLL, "max": MAX_ACTIVE_POLL,
+             "section": "Collector",
+             "help": "Poll interval while the alert is visible."},
+            {"name": "timeout", "label": "Collector timeout (s)",
+             "type": "number", "default": d["timeout"],
+             "min": MIN_TIMEOUT, "max": MAX_TIMEOUT, "section": "Collector",
+             "help": "HTTP timeout for requests to the collector."},
             {"name": "limit", "label": "Rows in the table",
-             "type": "number", "default": DEFAULT_CONFIG["limit"],
-             "min": MIN_LIMIT, "max": MAX_LIMIT},
-            {"name": "geo_ttl", "label": "Geo cache TTL (s)",
-             "type": "number", "default": DEFAULT_CONFIG["geo_ttl"],
-             "min": 60, "max": 30 * 86400},
-            {"name": "timeout", "label": "HTTP timeout (s)",
-             "type": "number", "default": DEFAULT_CONFIG["timeout"],
-             "min": MIN_TIMEOUT, "max": MAX_TIMEOUT},
+             "type": "number", "default": d["limit"],
+             "min": MIN_LIMIT, "max": MAX_LIMIT, "section": "Collector",
+             "help": "Number of attackers requested and enriched."},
+            {"name": "cooldown_seconds", "label": "Cooldown (s)",
+             "type": "number", "default": d["cooldown_seconds"],
+             "min": MIN_COOLDOWN, "max": MAX_COOLDOWN, "section": "Alert",
+             "help": "How long the topbar bar stays visible after the last attempt."},
+            {"name": "min_attempts", "label": "Minimum attempts",
+             "type": "number", "default": d["min_attempts"],
+             "min": MIN_ATTEMPTS, "max": MAX_ATTEMPTS, "section": "Alert",
+             "help": "Failed attempts inside the window needed to raise the alarm."},
+            {"name": "geo_enabled", "label": "Look up country / ISP",
+             "type": "checkbox", "default": d["geo_enabled"],
+             "section": "Enrichment",
+             "help": "Sends each attacker IP to the lookup service below. "
+                     "Turn off to keep IPs local."},
+            {"name": "geo_url", "label": "Lookup URL template",
+             "type": "url", "default": d["geo_url"], "section": "Enrichment",
+             "help": "Must contain {ip}. Must return ipwho.is-style JSON."},
+            {"name": "geo_timeout", "label": "Lookup timeout (s)",
+             "type": "number", "default": d["geo_timeout"],
+             "min": MIN_GEO_TIMEOUT, "max": MAX_GEO_TIMEOUT,
+             "section": "Enrichment"},
+            {"name": "geo_ttl", "label": "Lookup cache TTL (s)",
+             "type": "number", "default": d["geo_ttl"],
+             "min": 60, "max": 30 * 86400, "section": "Enrichment",
+             "help": "How long a result is reused per IP."},
+            {"name": "rdns_enabled", "label": "Reverse DNS",
+             "type": "checkbox", "default": d["rdns_enabled"],
+             "section": "Enrichment",
+             "help": "Resolve the host name of each attacker IP."},
+            {"name": "rdns_timeout", "label": "Reverse DNS timeout (s)",
+             "type": "number", "default": d["rdns_timeout"],
+             "min": MIN_RDNS_TIMEOUT, "max": MAX_RDNS_TIMEOUT,
+             "section": "Enrichment"},
         ]
+
+    def on_config_change(self, old: dict, new: dict) -> None:
+        """Apply new settings live: drop stale enrichment, poll right away."""
+        enrich = ("geo_enabled", "geo_url", "rdns_enabled")
+        if any(old.get(k) != new.get(k) for k in enrich):
+            with self._lock:
+                self._geo.clear()
+        if old.get("collector_url") != new.get("collector_url"):
+            with self._lock:
+                self._snapshot = {}
+        self._wake.set()
+
+    def migrate_config(self, old_version: str, config: dict) -> dict:
+        """Fill the settings added in 1.2.0; keep every existing value."""
+        cfg = dict(config)
+        for key, value in DEFAULT_CONFIG.items():
+            cfg.setdefault(key, value)
+        return cfg
 
     # ── Config ─────────────────────────────────────────────────────────────
 
@@ -431,6 +497,15 @@ class SshAttackersPlugin(Plugin):
                               defaults["geo_ttl"]),
             "timeout": _clamp(cfg.get("timeout"), MIN_TIMEOUT, MAX_TIMEOUT,
                               defaults["timeout"]),
+            "geo_enabled": _flag(cfg.get("geo_enabled"), defaults["geo_enabled"]),
+            "geo_url": (cfg["geo_url"] if valid_geo_url(cfg.get("geo_url"))
+                        else defaults["geo_url"]),
+            "geo_timeout": _clamp(cfg.get("geo_timeout"), MIN_GEO_TIMEOUT,
+                                  MAX_GEO_TIMEOUT, defaults["geo_timeout"]),
+            "rdns_enabled": _flag(cfg.get("rdns_enabled"),
+                                  defaults["rdns_enabled"]),
+            "rdns_timeout": _clamp(cfg.get("rdns_timeout"), MIN_RDNS_TIMEOUT,
+                                   MAX_RDNS_TIMEOUT, defaults["rdns_timeout"]),
         }
 
     # ── Refresher ──────────────────────────────────────────────────────────
@@ -442,8 +517,8 @@ class SshAttackersPlugin(Plugin):
                 delay = self._refresh_once()
             except Exception:               # a crashed refresher is worse
                 log.exception("ssh-attackers: refresh cycle crashed")
-            if self._stop.wait(delay):
-                return
+            self._wake.wait(delay)
+            self._wake.clear()
 
     def _refresh_once(self) -> float:
         cfg = self._config_snapshot()
@@ -525,10 +600,13 @@ class SshAttackersPlugin(Plugin):
             return hit[1]
 
         info = {"country": DASH, "city": DASH, "isp": DASH, "asn": DASH,
-                "rdns": self._reverse_dns(ip)}
+                "rdns": self._reverse_dns(ip, cfg)}
         ttl = GEO_FAIL_TTL_S
+        if not cfg["geo_enabled"]:
+            return info
         try:
-            geo = _get_json(GEO_URL.format(ip=ip), GEO_TIMEOUT_S, MAX_GEO_BYTES)
+            geo = _get_json(cfg["geo_url"].replace("{ip}", ip),
+                            cfg["geo_timeout"], MAX_GEO_BYTES)
             if geo.get("success") is True:
                 conn = geo.get("connection")
                 conn = conn if isinstance(conn, dict) else {}
@@ -550,10 +628,12 @@ class SshAttackersPlugin(Plugin):
             self._geo[ip] = (now + ttl, info)
         return info
 
-    def _reverse_dns(self, ip: str) -> str:
+    def _reverse_dns(self, ip: str, cfg: dict[str, Any]) -> str:
+        if not cfg["rdns_enabled"]:
+            return DASH
         future = self._dns.submit(socket.gethostbyaddr, ip)
         try:
-            return _text(future.result(timeout=RDNS_TIMEOUT_S)[0])
+            return _text(future.result(timeout=cfg["rdns_timeout"])[0])
         except (socket.herror, socket.gaierror, OSError, FutureTimeout):
             return DASH
 

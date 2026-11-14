@@ -62,7 +62,7 @@ Wants=network-online.target
 User=sshwatch
 Group=sshwatch
 SupplementaryGroups=systemd-journal
-Environment=SSH_WATCH_BIND=100.100.100.1
+Environment=SSH_WATCH_BIND=192.0.2.10
 ExecStart=/usr/bin/python3 /opt/ssh-watch/ssh_watch.py
 Restart=on-failure
 RestartSec=5
@@ -79,7 +79,7 @@ WantedBy=multi-user.target
 
 ```bash
 systemctl enable --now ssh-watch
-curl 'http://100.100.100.1:9101/attackers?limit=5'
+curl 'http://192.0.2.10:9101/attackers?limit=5'
 ```
 
 ```json
@@ -102,16 +102,27 @@ once, and an `Accepted` line cancels the attempt.
 
 ## Configuration
 
-| Field | Default | Meaning |
-|---|---|---|
-| `collector_url` | *(empty)* | Base URL of `ssh-watch`, no path — e.g. `http://100.100.100.1:9101` |
-| `cooldown_seconds` | `60` | How long the topbar bar stays visible after the last attempt |
-| `min_attempts` | `1` | Failed attempts inside the window needed to raise the alarm |
-| `poll_interval` | `60` | Collector poll while quiet |
-| `active_poll_interval` | `10` | Collector poll while the alert is up |
-| `limit` | `5` | Rows in the table (and the number of IPs enriched) |
-| `geo_ttl` | `86400` | Geo/ISP cache lifetime per IP |
-| `timeout` | `8` | HTTP timeout |
+Everything is set in **Settings → Plugins → ssh-attackers → Configure**. Changes
+apply live: the plugin polls again right away.
+
+| Field | Section | Type | Default | Meaning |
+|---|---|---|---|---|
+| `collector_url` | Collector | url | *(empty)* | Base URL of `ssh-watch`, no path — e.g. `http://192.0.2.10:9101` |
+| `poll_interval` | Collector | number | `60` | Collector poll while quiet (s) |
+| `active_poll_interval` | Collector | number | `10` | Collector poll while the alert is up (s) |
+| `timeout` | Collector | number | `8` | HTTP timeout for the collector (s) |
+| `limit` | Collector | number | `5` | Rows in the table (and the number of IPs enriched) |
+| `cooldown_seconds` | Alert | number | `60` | How long the topbar bar stays visible after the last attempt |
+| `min_attempts` | Alert | number | `1` | Failed attempts inside the window needed to raise the alarm |
+| `geo_enabled` | Enrichment | checkbox | on | Look up country / ISP / ASN (sends each attacker IP to the service) |
+| `geo_url` | Enrichment | url | ipwho.is | Lookup URL template containing `{ip}`; ipwho.is-style JSON |
+| `geo_timeout` | Enrichment | number | `6` | Lookup timeout (s) |
+| `geo_ttl` | Enrichment | number | `86400` | Lookup cache lifetime per IP (s) |
+| `rdns_enabled` | Enrichment | checkbox | on | Resolve reverse DNS names |
+| `rdns_timeout` | Enrichment | number | `3` | Reverse DNS timeout (s) |
+
+Collector-side settings (listen address, window, cache) belong to `collector/ssh_watch.py`
+on the monitored host and are not plugin settings.
 
 Detection latency is the collector's, not the plugin's: `ssh-watch` answers from
 a 15 s cache, so the bar lights up within a few seconds of a real attempt — the
